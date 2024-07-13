@@ -53,6 +53,7 @@ extern uint8_t MODE_BUTTON;
 extern uint8_t FLIP_BUTTON;
 extern uint8_t OPTION_BUTTON;
 
+extern float Battery_voltage[2];
 
 
 
@@ -67,5 +68,6 @@ uint8_t getArmButton(void);
 uint8_t getModeButton(void);
 uint8_t getFlipButton(void);
 uint8_t getOptionButton(void);
+uint16_t read_byte_data(uint8_t address);
 
 #endif

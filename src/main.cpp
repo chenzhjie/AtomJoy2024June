@@ -1,29 +1,29 @@
 //Controller for M5Fly
 //#define DEBUG
 
-#include <Arduino.h>
-#include <M5AtomS3.h>
-#include <WiFi.h>
-#include <esp_now.h>
-#include <esp_wifi.h>
+#include "main.h"
 #include <MPU6886.h>
 #include <MadgwickAHRS.h>
-#include <atoms3joy.h>
 #include <FS.h>
 #include <SPIFFS.h>
+#include "lvgl_porting.h"
 
+#include "./images/start_img.h"
+#include "./images/pair_confirm.h"
+#include "./images/press_fly.h"
+#include "./images/pair_success.h"
+#include "./images/move_start_0.h"
+#include "./images/move_start_1.h"
+#include "./images/move_start_2.h"
+#include "./images/move_start_3.h"
+#include "./images/move_start_4.h"
+#include "./images/move_start_5.h"
 
-#define CHANNEL 1
+#include "app_lvgl.h"
 
-#define ANGLECONTROL 0
-#define RATECONTROL 1
-#define ANGLECONTROL_W_LOG 2
-#define RATECONTROL_W_LOG 3
-#define ALT_CONTROL_MODE 4
-#define NOT_ALT_CONTROL_MODE 5
-#define RESO10BIT (4096)
+M5GFX display;
 
-
+TaskHandle_t task_tone_handle    = NULL;
 esp_now_peer_info_t peerInfo;
 
 float Throttle;
@@ -35,7 +35,7 @@ uint16_t Throttle_bias = 2048;
 short xstick=0;
 short ystick=0;
 uint8_t Mode=ANGLECONTROL;
-uint8_t AltMode=NOT_ALT_CONTROL_MODE;
+uint8_t AltMode=ALT_CONTROL_MODE;
 volatile uint8_t Loop_flag=0;
 float Timer = 0.0;
 float dTime = 0.01;
@@ -47,8 +47,28 @@ unsigned long stime,etime,dtime;
 byte axp_cnt=0;
 
 char data[140];
-uint8_t senddata[24];//19->22->23->24
+uint8_t senddata[25];//19->22->23->24->25
 uint8_t disp_counter=0;
+
+volatile uint8_t is_peering = 0;
+volatile uint8_t fly_status = 0;
+volatile uint8_t fly_status_manual = 0;
+volatile uint8_t auto_up_down_status = 0;
+volatile uint32_t auto_up_down_status_counter = 0;
+
+volatile float fly_bat_voltage = 0.0f;
+volatile float roll_angle = 0.0f;
+volatile float pitch_angle = 0.0f;
+volatile float yaw_angle = 0.0f;
+volatile float altitude = 0.0f;
+volatile int16_t tof_front = 0.0;
+
+volatile uint8_t alt_flag = 0;
+volatile uint8_t fly_mode = 0;
+volatile uint8_t last_fly_mode = 0;
+
+volatile uint8_t proactive_flag = 0;
+volatile uint32_t proactive_flag_counter = 0;
 
 //StampFly MAC ADDRESS
 //1 F4:12:FA:66:80:54 (Yellow)
@@ -61,24 +81,46 @@ uint8_t Addr2[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint8_t Ch_counter;
 volatile uint8_t Received_flag = 0;
 volatile uint8_t Channel = CHANNEL;
+volatile uint8_t is_fly_flag = 0;
+volatile unsigned long is_fly_flag_counter = 0;
 
 void rc_init(void);
 void data_send(void);
 void show_battery_info();
 void voltage_print(void);
+void task_tone(void * pvParameters);
 
 // 受信コールバック
 void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len) 
 {
-  Received_flag = 1;
-  Channel = recv_data[0];
-  Addr2[0] = recv_data[1];
-  Addr2[1] = recv_data[2];
-  Addr2[2] = recv_data[3];
-  Addr2[3] = recv_data[4];
-  Addr2[4] = recv_data[5];
-  Addr2[5] = recv_data[6];
-  USBSerial.printf("Receive !\n");
+  if (is_peering) {
+    if (recv_data[7] == 0xaa && recv_data[8] == 0x55 && recv_data[9] == 0x16 && recv_data[10] == 0x88) {
+      Received_flag = 1;
+      Channel = recv_data[0];
+      Addr2[0] = recv_data[1];
+      Addr2[1] = recv_data[2];
+      Addr2[2] = recv_data[3];
+      Addr2[3] = recv_data[4];
+      Addr2[4] = recv_data[5];
+      Addr2[5] = recv_data[6];
+      USBSerial.printf("Receive !\n");
+    }
+  }
+  else {
+    if (recv_data[0] == 88 && recv_data[1] == 88) {
+      memcpy((uint8_t *)&roll_angle, &recv_data[2+4*(3-1)], 4);
+      memcpy((uint8_t *)&pitch_angle, &recv_data[2+4*(4-1)], 4);
+      memcpy((uint8_t *)&yaw_angle, &recv_data[2+4*(5-1)], 4);
+      memcpy((uint8_t *)&fly_bat_voltage, &recv_data[2+4*(15-1)], 4);
+      memcpy((uint8_t *)&altitude, &recv_data[2+4*(25-1)], 4);
+      alt_flag = recv_data[2+4*(28-1)];
+      fly_mode = recv_data[2+4*(28-1)+1];
+      memcpy((uint8_t *)&tof_front, &recv_data[2+4*(28-1)+2], 2);
+      is_fly_flag = 1;
+      // USBSerial.printf("roll:%.2f, pitch:%.2f, yaw:%.2f, voltage:%.2f, alt_flag:%d, fly_mode:%d, tof_front:%d\r\n", 
+      // roll_angle, pitch_angle, yaw_angle, fly_bat_voltage, alt_flag, fly_mode, tof_front);
+    }
+  }
 }
 
 #define BUF_SIZE 128
@@ -147,6 +189,8 @@ void rc_init(uint8_t ch, uint8_t* addr)
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   if (esp_now_init() == ESP_OK) {
+    esp_now_unregister_recv_cb();
+    esp_now_register_recv_cb(OnDataRecv);
     USBSerial.println("ESPNow Init Success");
   } else {
     USBSerial.println("ESPNow Init Failed");
@@ -168,10 +212,13 @@ void rc_init(uint8_t ch, uint8_t* addr)
 void peering(void)
 {
   uint8_t break_flag;
+  uint32_t beep_delay = 0;
+  char dis_buff[100] = {0};
   //StampFlyはMACアドレスをFF:FF:FF:FF:FF:FFとして
   //StampFlyのMACアドレスをでブロードキャストする
   //その際にChannelが機体と送信機で同一でない場合は受け取れない
   // ESP-NOWコールバック登録
+  esp_now_unregister_recv_cb();
   esp_now_register_recv_cb(OnDataRecv);
 
   //ペアリング
@@ -200,6 +247,10 @@ void peering(void)
           }
           usleep(100);
     }
+    if (millis() - beep_delay >= 500) {
+      beep();
+      beep_delay = millis();
+    }
     if (break_flag)break;
     Ch_counter++;
     if(Ch_counter==15)Ch_counter=1;
@@ -207,6 +258,12 @@ void peering(void)
   //Channel = Ch_counter;
 
   save_data();
+  is_peering = 0;
+  display.startWrite();
+  display.pushImage(0, 0, pair_success_Width, pair_success_Height, pair_success_);
+  display.endWrite();  
+  buzzer_sound(4000, 600);
+  delay(1000);
 
   USBSerial.printf("Channel:%02d\n\r", Channel);
   USBSerial.printf("MAC2:%02X:%02X:%02X:%02X:%02X:%02X:\n\r",
@@ -227,6 +284,10 @@ void peering(void)
         USBSerial.println("Failed to add peer2");
   }  
   esp_wifi_set_channel(Channel, WIFI_SECOND_CHAN_NONE);
+  display.startWrite();
+  display.clear(BLACK);
+  display.endWrite();  
+  esp_restart();
 }
 
 void change_channel(uint8_t ch)
@@ -250,18 +311,32 @@ void IRAM_ATTR onTimer()
 
 void setup() {
   M5.begin();
-  Wire1.begin(38, 39, 400*1000);
+  Wire1.begin(38, 39);
+  Wire1.setClock(400*1000);
   load_data();
   M5.update();  
-  M5.Lcd.setRotation( 2 );
-  M5.Lcd.setTextFont(2);
-  M5.Lcd.setCursor(4, 2);
+  setup_pwm_buzzer();
+  display.begin();
+  display.setEpdMode(epd_mode_t::epd_quality);
   
-  if(M5.Btn.isPressed())
+  if(M5.Btn.isPressed() || 
+  (Addr2[0] == 0xFF && Addr2[1] == 0xFF && Addr2[2] == 0xFF && Addr2[3] == 0xFF && Addr2[4] == 0xFF && Addr2[5] == 0xFF))
   {
+    display.startWrite();
+    display.pushImage(0, 0, pair_confirm_Width, pair_confirm_Height, pair_confirm_);
+    display.endWrite();
+    while(1) {
+      M5.update(); 
+      if (M5.Btn.wasPressed()) {
+        is_peering = 1;
+        break;
+      }
+    }
     rc_init(1, Addr1);
     USBSerial.printf("Button pressed!\n\r");
-    M5.Lcd.println("Peering...");
+    display.startWrite();
+    display.pushImage(0, 0, press_fly_Width, press_fly_Height, press_fly_);
+    display.endWrite();
     peering();
   }
   #ifdef DEBUG
@@ -270,17 +345,54 @@ void setup() {
   else rc_init(Channel, Addr2);
   #endif
 
+  xTaskCreatePinnedToCore(task_tone,             //任务函数
+  "task_tone",            //任务名称
+  1024*2,               //堆栈大小
+  NULL,               //传递参数
+  0,                  //任务优先级
+  &task_tone_handle,      //任务句柄
+  tskNO_AFFINITY);    //无关联，不绑定在任何一个核上 
+
+  display.startWrite();
+  display.pushImage(0, 0, move_start_0_Width, move_start_0_Height, move_start_0_);
+  display.endWrite();
+  delay(100);
+  display.startWrite();
+  display.pushImage(0, 0, move_start_1_Width, move_start_1_Height, move_start_1_);
+  display.endWrite();
+  delay(100);
+  display.startWrite();
+  display.pushImage(0, 0, move_start_2_Width, move_start_2_Height, move_start_2_);
+  display.endWrite();
+  delay(100);
+  display.startWrite();
+  display.pushImage(0, 0, move_start_3_Width, move_start_3_Height, move_start_3_);
+  display.endWrite();
+  delay(100);
+  display.startWrite();
+  display.pushImage(0, 0, move_start_4_Width, move_start_4_Height, move_start_4_);
+  display.endWrite();
+  delay(100);
+  display.startWrite();
+  display.pushImage(0, 0, move_start_5_Width, move_start_5_Height, move_start_5_);
+  display.endWrite();
+  delay(1100);
+
   joy_update();
 
   StickMode = 2;
-  if(getOptionButton())
-  {
-    StickMode = 3;
-    M5.Lcd.println("Please release button.");
-    while(getOptionButton())joy_update();
-  }
-  AltMode =NOT_ALT_CONTROL_MODE;
+  // if(getOptionButton())
+  // {
+  //   StickMode = 3;
+  //   display.startWrite();
+  //   display.drawCenterString("Please release button.", display.width()/2, display.height()/2);
+  //   display.endWrite();    
+  //   while(getOptionButton())joy_update();
+  // }
+  AltMode =ALT_CONTROL_MODE;
   delay(500);
+
+  lvgl_init();
 
   if (StickMode == 3)
   {
@@ -359,14 +471,14 @@ uint8_t check_control_mode_change(void)
   state = 0;
   if (flag==0)
   {
-    if (getModeButton() == 1)
+    if (getOptionButton() == 1)
     {
       flag = 1;
     }
   }
   else
   {
-    if (getModeButton() == 0)
+    if (getOptionButton() == 0)
     {
       flag = 0;
       state = 1;
@@ -383,14 +495,14 @@ uint8_t check_alt_mode_change(void)
   state = 0;
   if (flag==0)
   {
-    if (getOptionButton() == 1)
+    if (getModeButton() == 1)
     {
       flag = 1;
     }
   }
   else
   {
-    if (getOptionButton() == 0)
+    if (getModeButton() == 0)
     {
       flag = 0;
       state = 1;
@@ -441,24 +553,12 @@ void loop() {
     Timer_state = 0;
   }
 
-  if (check_control_mode_change() == 1)
-  {
-    if (Mode==ANGLECONTROL)Mode=RATECONTROL;
-    else Mode = ANGLECONTROL;
-  }
-
-  if (check_alt_mode_change() == 1)
-  {
-    if (AltMode==ALT_CONTROL_MODE)AltMode=NOT_ALT_CONTROL_MODE;
-    else AltMode = ALT_CONTROL_MODE;
-  }
-
   _throttle = getThrottle();
   _phi = getAileron();
   _theta = getElevator();
   _psi = getRudder();
 
-  if(getArmButton()==1)
+  if(auto_up_down_status && (page_nums == PAGE_RUNNING))
   {
     //Throttle_bias = _throttle;
     Phi_bias = _phi;
@@ -505,14 +605,16 @@ void loop() {
   senddata[17]=d_int[2];
   senddata[18]=d_int[3];
 
-  senddata[19]=getArmButton();
+  senddata[19] = auto_up_down_status;
   senddata[20]=getFlipButton();
   senddata[21]=Mode;
   senddata[22]=AltMode;
+
+  senddata[23]=proactive_flag;
   
   //checksum
-  senddata[23]=0;
-  for(uint8_t i=0;i<23;i++)senddata[23]=senddata[23]+senddata[i];
+  senddata[24]=0;
+  for(uint8_t i=0;i<24;i++)senddata[24]=senddata[24]+senddata[i];
   
   //送信
   esp_err_t result = esp_now_send(peerInfo.peer_addr, senddata, sizeof(senddata));
@@ -529,45 +631,6 @@ void loop() {
   //float vbat =0.0;// M5.Axp.GetBatVoltage();
   //int8_t bat_charge_p = int8_t((vbat - 3.0) / 1.2 * 100);
   
-  M5.Lcd.setCursor(4, 2+disp_counter*17);
-  switch (disp_counter)
-  {
-    case 0:
-      M5.Lcd.printf("MAC ADR %02X:%02X    ", peerInfo.peer_addr[4],peerInfo.peer_addr[5]);
-      break;
-    case 1:
-      M5.Lcd.printf("BAT 1:%4.1f 2:%4.1f", Battery_voltage[0],Battery_voltage[1]);
-      //M5.Lcd.printf("X:%4d",xstick);
-      break;
-    case 2:
-      #ifdef NEW_ATOM_JOY
-      M5.Lcd.printf("MODE: %d", StickMode);
-      //M5.Lcd.printf("X:%4d",xstick);
-      #endif
-      break;
-    case 3:
-      M5.Lcd.printf("CHL: %02d",peerInfo.channel);
-      break;
-    case 4:
-      if( AltMode == ALT_CONTROL_MODE ) M5.Lcd.printf("-Auto ALT-  ");
-      else if ( AltMode == NOT_ALT_CONTROL_MODE )   M5.Lcd.printf("-Mnual ALT- ");
-      break;
-    case 5:
-      if( Mode == ANGLECONTROL )      M5.Lcd.printf("-STABILIZE-");
-      else if ( Mode == RATECONTROL ) M5.Lcd.printf("-ACRO-     ");
-      break;
-    case 6:
-      M5.Lcd.printf("Time:%7.2f",Timer);
-      break;
-    case 7:
-      break;
-    case 8:
-      break;
-    case 9:
-      break;
-  }
-  disp_counter++;
-  if(disp_counter==11)disp_counter=0;
 
   //Reset
   if( /*M5.Axp.GetBtnPress() == 2*/ 0 ){
@@ -575,7 +638,27 @@ void loop() {
     //M5.Lcd.println("AtomFly2.0"); 
     esp_restart();
   } 
-
+  if (auto_up_down_status) {
+    auto_up_down_status_counter++;
+    if (auto_up_down_status_counter > 20) {
+      auto_up_down_status_counter = 0;
+      auto_up_down_status = 0;
+    }
+  }
+  if (proactive_flag) {
+    proactive_flag_counter++;
+    if (proactive_flag_counter > 20) {
+      proactive_flag_counter = 0;
+      proactive_flag = 0;
+    }
+  }
+  if (is_fly_flag) {
+    is_fly_flag_counter++;
+    if (is_fly_flag_counter > 2000) {
+      is_fly_flag_counter = 0;
+      is_fly_flag = 0;
+    }
+  }
 }
 
 void show_battery_info(){
@@ -599,6 +682,16 @@ void show_battery_info(){
 void voltage_print(void)
 {
 
-  M5.Lcd.setCursor(0, 17, 2);
-  M5.Lcd.printf("%3.1fV", Battery_voltage);
+  // M5.Lcd.setCursor(0, 17, 2);
+  // M5.Lcd.printf("%3.1fV", Battery_voltage);
+}
+
+void task_tone(void * pvParameters) 
+{
+  for (;;)
+  {
+    start_tone();
+    vTaskDelete(task_tone_handle);  
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
 }
